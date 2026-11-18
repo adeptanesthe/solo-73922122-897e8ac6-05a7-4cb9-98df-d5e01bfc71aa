@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, pollTimer: null };
+const state = { data: null, pollTimer: null, msDirty: false };
 
 async function api(path, options = {}) {
   const resp = await fetch(path, {
@@ -191,6 +191,124 @@ async function openArticle(id) {
   $("#article-dialog").showModal();
 }
 
+/* ---------------- 稿件主题归档 ---------------- */
+
+function renderMsDirtyHint() {
+  const submitted = state.data && state.data.manuscript ? state.data.manuscript.text : "";
+  const show = state.msDirty && $("#manuscript").value !== submitted;
+  $("#ms-dirty").style.display = show ? "block" : "none";
+}
+
+function renderClassify() {
+  const ms = state.data.manuscript;
+  const cj = state.data.classify_job;
+  const result = state.data.classify_result;
+  const cal = state.data.calibration;
+
+  const statusEl = $("#classify-status");
+  if (!ms || ms.generation === 0) {
+    statusEl.className = "job-status";
+    statusEl.textContent = "尚未提交稿件";
+  } else if (cj) {
+    const label = {
+      pending: "等待判定",
+      running: "正在判定（期间可继续改稿，迟到结果不会覆盖当前稿件）",
+      done: "判定完成",
+      failed: `判定失败：${cj.error || "未知错误"}`,
+      stale: "该结果已过期（稿件已变更）",
+    }[cj.status] || cj.status;
+    statusEl.className = `job-status ${cj.status}`;
+    statusEl.textContent = `稿件世代 ${cj.generation} · ${label}`;
+  }
+
+  $("#threshold-line").textContent = cal
+    ? `校准阈值 τ = ${cal.threshold.toFixed(4)}（按作者整组留出 ${cal.folds} 折：` +
+      `每折重新拟合特征，≥${Math.round(cal.required_coverage * 100)}% 留出文章真主题得分达标，` +
+      `实际覆盖率 ${(cal.coverage * 100).toFixed(1)}%，共 ${cal.held_out} 篇留出文章）`
+    : "校准信息不可用";
+
+  const foldsEl = $("#calibration-folds");
+  foldsEl.innerHTML = "";
+  if (cal && cal.fold_details) {
+    cal.fold_details.forEach((f) => {
+      const div = document.createElement("div");
+      div.className = "fold-line";
+      div.textContent =
+        `留出作者 ${f.held_out_author}：训练 ${f.n_train} 篇 / 留出 ${f.n_held_out} 篇，` +
+        `当折特征 ${f.n_features} 维，留出真主题得分 ` +
+        f.true_scores.map((s) => s.toFixed(4)).join("、");
+      foldsEl.appendChild(div);
+    });
+  }
+
+  const banner = $("#decision-banner");
+  const box = $("#topic-scores");
+  box.innerHTML = "";
+  if (!result) {
+    banner.className = "decision-banner none";
+    banner.textContent =
+      cj && (cj.status === "pending" || cj.status === "running") ? "判定中……" : "等待判定结果";
+    return;
+  }
+
+  const d = result.decision;
+  if (d.action === "archive") {
+    banner.className = "decision-banner archive";
+    banner.textContent = `建议归档至「${d.topic}」—— ${d.reason}`;
+  } else {
+    banner.className = "decision-banner review";
+    banner.textContent = `需人工复核 —— ${d.reason}`;
+  }
+
+  const threshold = result.threshold;
+  const scale = Math.max(threshold, ...result.topics.map((t) => t.score), 1e-9) * 1.06;
+  [...result.topics]
+    .sort((a, b) => b.score - a.score)
+    .forEach((t) => {
+      const reached = t.score >= threshold;
+      const row = document.createElement("div");
+      row.className = `topic-row ${reached ? "reached" : ""}`;
+      const pct = ((t.score / scale) * 100).toFixed(1);
+      const thPct = ((threshold / scale) * 100).toFixed(1);
+      row.innerHTML = `
+        <div class="tr-head">
+          <span class="tr-name">${t.topic}</span>
+          <span class="tr-score">${t.score.toFixed(4)}${reached ? " ✓ 达阈值" : ""}</span>
+        </div>
+        <div class="tr-bar">
+          <div class="tr-fill" style="width:${pct}%"></div>
+          <div class="tr-threshold" title="阈值 τ" style="left:${thPct}%"></div>
+        </div>
+        <div class="tr-evidence">依据文章：<a href="#" data-aid="${t.evidence.article_id}">#${t.evidence.article_id} ${t.evidence.title}</a>（${t.evidence.author} · 相似度 ${t.evidence.similarity.toFixed(4)}）</div>`;
+      row.querySelector("a").addEventListener("click", (e) => {
+        e.preventDefault();
+        openArticle(t.evidence.article_id);
+      });
+      box.appendChild(row);
+    });
+}
+
+async function submitManuscript() {
+  const msg = $("#classify-msg");
+  try {
+    const payload = {
+      text: $("#manuscript").value,
+      compute_delay_ms: parseInt($("#ms-delay").value, 10) || 0,
+    };
+    $("#btn-classify").disabled = true;
+    state.data = await api("/api/manuscript", { method: "PUT", body: JSON.stringify(payload) });
+    state.msDirty = false;
+    renderClassify();
+    renderMsDirtyHint();
+    showMsg(msg, "稿件已提交，归档判定已开始", true);
+    schedulePoll();
+  } catch (err) {
+    showMsg(msg, err.message);
+  } finally {
+    $("#btn-classify").disabled = false;
+  }
+}
+
 function readQuotas() {
   const quotas = {};
   document.querySelectorAll("#quota-grid input").forEach((el) => {
@@ -208,15 +326,24 @@ function showMsg(el, text, ok = false) {
 async function refresh() {
   state.data = await api("/api/status");
   $("#interest").value = state.data.state.interest;
+  // 稿件编辑中不被轮询覆盖：仅在未本地修改时同步服务端稿件
+  if (!state.msDirty) {
+    $("#manuscript").value = state.data.manuscript ? state.data.manuscript.text : "";
+    $("#ms-count").textContent = $("#manuscript").value.length;
+  }
   renderQuotas();
   renderQueue();
+  renderClassify();
+  renderMsDirtyHint();
   schedulePoll();
 }
 
 function schedulePoll() {
   clearTimeout(state.pollTimer);
   const j = state.data.job;
-  if (j && (j.status === "pending" || j.status === "running")) {
+  const cj = state.data.classify_job;
+  const busy = (x) => x && (x.status === "pending" || x.status === "running");
+  if (busy(j) || busy(cj)) {
     state.pollTimer = setTimeout(refresh, 600);
   }
 }
@@ -292,10 +419,15 @@ async function removeExclusion(id) {
 }
 
 async function resetDemo() {
-  if (!confirm("确定重置全部演示数据？已揭示前缀将被清空。")) return;
+  if (!confirm("确定重置全部演示数据？已揭示前缀与稿件将被清空。")) return;
   state.data = await api("/api/reset", { method: "POST" });
+  state.msDirty = false;
+  $("#manuscript").value = state.data.manuscript ? state.data.manuscript.text : "";
+  $("#ms-count").textContent = $("#manuscript").value.length;
   renderQuotas();
   renderQueue();
+  renderClassify();
+  renderMsDirtyHint();
   schedulePoll();
 }
 
@@ -303,7 +435,13 @@ $("#btn-apply").addEventListener("click", applyCondition);
 $("#btn-reveal").addEventListener("click", revealNext);
 $("#btn-exclude").addEventListener("click", addExclusion);
 $("#btn-reset").addEventListener("click", resetDemo);
+$("#btn-classify").addEventListener("click", submitManuscript);
 $("#article-filter").addEventListener("input", renderArticleList);
+$("#manuscript").addEventListener("input", () => {
+  state.msDirty = true;
+  $("#ms-count").textContent = $("#manuscript").value.length;
+  renderMsDirtyHint();
+});
 $("#dlg-close").addEventListener("click", () => $("#article-dialog").close());
 
 refresh().catch((err) => {

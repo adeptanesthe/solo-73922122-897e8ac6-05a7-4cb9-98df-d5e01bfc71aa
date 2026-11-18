@@ -10,7 +10,7 @@
 <header class="topbar">
   <h1>技术编辑选题推荐系统</h1>
   <div class="meta">
-    <span>字符 2~3 元 TF-IDF（仅文章拟合）· 余弦相关度 · 全局最优队列</span>
+    <span>字符 2~3 元 TF-IDF（仅文章拟合）· 余弦相关度 · 全局最优队列 · 稿件主题归档</span>
     <button id="btn-reset" class="btn btn-ghost">重置演示</button>
   </div>
 </header>
@@ -59,6 +59,37 @@
     <h2>4. 本地文章库（30 篇）</h2>
     <input id="article-filter" class="filter-input" placeholder="按标题 / 主题 / 作者筛选……" />
     <div id="article-list" class="article-list"></div>
+  </section>
+
+  <!-- 通栏：稿件主题归档 -->
+  <section class="panel classify-panel">
+    <h2>5. 稿件主题归档（待分栏目稿件 → 主题编辑）</h2>
+    <div class="classify-grid">
+      <div class="classify-left">
+        <label class="field-label" for="manuscript">稿件正文（不超过 2000 字）</label>
+        <textarea id="manuscript" rows="7" maxlength="2000" placeholder="粘贴待归档的稿件正文……"></textarea>
+        <div class="char-count"><span id="ms-count">0</span> / 2000</div>
+
+        <label class="field-label" for="ms-delay">模拟慢判定延迟（毫秒，演示改稿后的过期保护）</label>
+        <input id="ms-delay" type="number" min="0" max="30000" step="500" value="0" />
+
+        <div class="btn-row">
+          <button id="btn-classify" class="btn btn-primary">提交归档判定</button>
+          <span id="classify-msg" class="msg"></span>
+        </div>
+        <div id="ms-dirty" class="msg dirty-hint">稿件已修改尚未提交，当前结果对应上次提交的版本</div>
+        <div class="job-status" id="classify-status">尚未提交稿件</div>
+      </div>
+      <div class="classify-right">
+        <div id="decision-banner" class="decision-banner none">等待判定结果</div>
+        <div id="threshold-line" class="generation-line"></div>
+        <details id="calibration-details" class="calibration-details">
+          <summary>校准明细（按作者整组留出，每折重新拟合特征）</summary>
+          <div id="calibration-folds"></div>
+        </details>
+        <div id="topic-scores" class="topic-scores"></div>
+      </div>
+    </div>
   </section>
 </main>
 

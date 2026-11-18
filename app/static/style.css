@@ -93,3 +93,35 @@ dialog::backdrop { background: rgba(15,39,66,.45); }
 dialog article { padding: 22px; }
 .dlg-meta { font-size: 12px; color: #64748b; margin: 8px 0 14px; }
 #dlg-body { line-height: 1.8; font-size: 14px; white-space: pre-wrap; }
+
+/* ---- 稿件主题归档 ---- */
+.classify-panel { grid-column: 1 / -1; }
+.classify-grid { display: grid; grid-template-columns: 380px 1fr; gap: 24px; }
+@media (max-width: 1000px) { .classify-grid { grid-template-columns: 1fr; } }
+.char-count { font-size: 12px; color: #94a3b8; text-align: right; margin-top: 4px; }
+.dirty-hint { display: none; margin-top: 10px; color: #b45309; }
+.decision-banner {
+  font-size: 14px; font-weight: 600; padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
+}
+.decision-banner.none { background: #f1f5f9; color: #64748b; font-weight: 400; }
+.decision-banner.archive { background: #dcfce7; color: #166534; }
+.decision-banner.review { background: #fef3c7; color: #92400e; }
+.calibration-details { font-size: 12px; color: #64748b; margin: 8px 0 12px; }
+.calibration-details summary { cursor: pointer; }
+.calibration-details .fold-line { padding: 3px 0; border-bottom: 1px dashed #e2e8f0; }
+.topic-scores { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+.topic-row { border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; }
+.topic-row.reached { border-color: #16a34a; background: #f0fdf4; }
+.tr-head { display: flex; justify-content: space-between; font-size: 13px; }
+.tr-name { font-weight: 600; }
+.tr-score { color: #2563eb; font-variant-numeric: tabular-nums; }
+.topic-row.reached .tr-score { color: #166534; font-weight: 600; }
+.tr-bar { position: relative; height: 8px; background: #e2e8f0; border-radius: 999px; margin: 6px 0; }
+.tr-fill { position: absolute; left: 0; top: 0; bottom: 0; background: #2563eb; border-radius: 999px; }
+.topic-row.reached .tr-fill { background: #16a34a; }
+.tr-threshold {
+  position: absolute; top: -3px; bottom: -3px; width: 2px; background: #dc2626;
+}
+.tr-evidence { font-size: 12px; color: #64748b; }
+.tr-evidence a { color: #2563eb; text-decoration: none; }
+.tr-evidence a:hover { text-decoration: underline; }

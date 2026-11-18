@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""SQLite 持久化层：会话状态、异步重算任务、排除集。
+"""SQLite 持久化层：会话状态、异步重算任务、排除集、稿件归档判定。
 
 设计要点
 ========
@@ -7,7 +7,9 @@
 * WAL 模式 + BEGIN IMMEDIATE 写事务，配合进程内写锁串行化所有变更，
   保证并发请求下“同条件同进度只推进一次”；
 * 已揭示前缀、条件、世代号(generation)全部落盘，重启后完整恢复；
-* 后台任务只在“仍是最新世代且条件未变”时才允许写回结果，迟到结果被丢弃。
+* 后台任务只在“仍是最新世代且条件未变”时才允许写回结果，迟到结果被丢弃；
+* 稿件归档同理：每次提交稿件开启新世代，判定结果只在世代未变时落库，
+  编辑改稿后迟到的旧判定不得覆盖当前稿件。
 """
 from __future__ import annotations
 
@@ -132,6 +134,26 @@ def init_db() -> None:
                     outcome_json TEXT NOT NULL,
                     expires_at REAL NOT NULL
                 );
+
+                -- 待归档稿件（单会话，id 固定为 1）；generation 随每次提交 +1
+                CREATE TABLE IF NOT EXISTS manuscript (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    text TEXT NOT NULL DEFAULT '',
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- 异步归档判定任务：每个稿件世代至多一条
+                CREATE TABLE IF NOT EXISTS classify_jobs (
+                    generation INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL,              -- pending/running/done/failed/stale
+                    text_snapshot TEXT NOT NULL,       -- 提交时的稿件快照
+                    compute_delay_ms INTEGER NOT NULL DEFAULT 0,
+                    result_json TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
                 """
             )
             # 轻量迁移：早期版本 reveal_claims.expires_at 为 TEXT，
@@ -184,6 +206,16 @@ def init_db() -> None:
                     "INSERT INTO jobs(generation, status, condition_snapshot_json, "
                     "created_at) VALUES (1, 'pending', ?, ?)",
                     (json.dumps(snapshot, ensure_ascii=False), _now()),
+                )
+            # 稿件状态种子（幂等）：空稿件、世代 0，不自动生成判定任务
+            ms_exists = conn.execute(
+                "SELECT 1 FROM manuscript WHERE id = 1"
+            ).fetchone()
+            if not ms_exists:
+                conn.execute(
+                    "INSERT INTO manuscript(id, text, generation, updated_at) "
+                    "VALUES (1, '', 0, ?)",
+                    (_now(),),
                 )
 
 
@@ -422,6 +454,133 @@ def fail_job(generation: int, error: str) -> bool:
         return current_gen == generation
 
 
+# ---------------- 稿件归档：状态与异步判定任务 ----------------
+
+
+def get_manuscript() -> dict[str, Any]:
+    with _read_tx() as conn:
+        row = conn.execute("SELECT * FROM manuscript WHERE id = 1").fetchone()
+        return {
+            "text": row["text"],
+            "generation": row["generation"],
+            "updated_at": row["updated_at"],
+        }
+
+
+def _classify_job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "generation": row["generation"],
+        "status": row["status"],
+        "text_snapshot": row["text_snapshot"],
+        "compute_delay_ms": row["compute_delay_ms"],
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def get_latest_classify_job() -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM classify_jobs ORDER BY generation DESC LIMIT 1"
+        ).fetchone()
+        return _classify_job_row_to_dict(row) if row else None
+
+
+def get_classify_job(generation: int) -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM classify_jobs WHERE generation = ?", (generation,)
+        ).fetchone()
+        return _classify_job_row_to_dict(row) if row else None
+
+
+def submit_manuscript(text: str, compute_delay_ms: int) -> dict[str, Any]:
+    """登记新稿件：世代号 +1，旧判定任务标记 stale，登记新 pending 任务。"""
+    with _write_tx() as conn:
+        row = conn.execute("SELECT * FROM manuscript WHERE id = 1").fetchone()
+        new_gen = row["generation"] + 1
+        conn.execute(
+            "UPDATE manuscript SET text = ?, generation = ?, updated_at = ? "
+            "WHERE id = 1",
+            (text, new_gen, _now()),
+        )
+        conn.execute(
+            "UPDATE classify_jobs SET status = 'stale', finished_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (_now(),),
+        )
+        conn.execute(
+            "INSERT INTO classify_jobs(generation, status, text_snapshot, "
+            "compute_delay_ms, created_at) VALUES (?, 'pending', ?, ?, ?)",
+            (new_gen, text, compute_delay_ms, _now()),
+        )
+    return get_manuscript()
+
+
+def claim_pending_classify_job() -> dict[str, Any] | None:
+    """原子领取一条 pending 判定任务；没有则返回 None。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM classify_jobs WHERE status = 'pending' "
+            "ORDER BY generation DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        generation = row["generation"]
+        conn.execute(
+            "UPDATE classify_jobs SET status = 'running' WHERE generation = ?",
+            (generation,),
+        )
+    return get_classify_job(generation)
+
+
+def complete_classify_job(generation: int, result: dict[str, Any]) -> bool:
+    """写回判定结果。若稿件世代已过期则拒绝（迟到结果不得覆盖当前稿件）。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM classify_jobs WHERE generation = ?", (generation,)
+        ).fetchone()
+        current_gen = conn.execute(
+            "SELECT generation FROM manuscript WHERE id = 1"
+        ).fetchone()[0]
+        if not row or row["status"] != "running" or current_gen != generation:
+            # 迟到结果：旧稿件的判定不得落库
+            conn.execute(
+                "UPDATE classify_jobs SET status = 'stale', finished_at = ? "
+                "WHERE generation = ? AND status = 'running'",
+                (_now(), generation),
+            )
+            return False
+        conn.execute(
+            "UPDATE classify_jobs SET status = 'done', result_json = ?, "
+            "finished_at = ? WHERE generation = ?",
+            (json.dumps(result, ensure_ascii=False), _now(), generation),
+        )
+        return True
+
+
+def fail_classify_job(generation: int, error: str) -> bool:
+    """记录判定失败；过期任务只标记 stale。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM classify_jobs WHERE generation = ?", (generation,)
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        current_gen = conn.execute(
+            "SELECT generation FROM manuscript WHERE id = 1"
+        ).fetchone()[0]
+        new_status = "failed" if current_gen == generation else "stale"
+        conn.execute(
+            "UPDATE classify_jobs SET status = ?, error = ?, finished_at = ? "
+            "WHERE generation = ?",
+            (new_status, error[:500], _now(), generation),
+        )
+        return current_gen == generation
+
+
 # ---------------- 揭示推进 ----------------
 
 
@@ -573,6 +732,12 @@ def reset_all(
         conn.execute("DELETE FROM exclusions")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM reveal_claims")
+        conn.execute("DELETE FROM classify_jobs")
+        conn.execute(
+            "UPDATE manuscript SET text = '', generation = 0, updated_at = ? "
+            "WHERE id = 1",
+            (_now(),),
+        )
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = 1, "
             "revealed_json = '[]', updated_at = ? WHERE id = 1",

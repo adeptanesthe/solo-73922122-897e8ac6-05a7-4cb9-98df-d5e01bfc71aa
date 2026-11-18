@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """后台重算 worker。
 
-* 守护线程轮询 pending 任务，模拟慢重算（可由 compute_delay_ms 控制）；
-* 计算前快照条件，写回前再次核对世代号，迟到结果一律拒绝落库；
+* 守护线程轮询 pending 任务（推荐重算 + 稿件归档判定），模拟慢计算
+  （可由 compute_delay_ms 控制）；
+* 计算前快照条件/稿件，写回前再次核对世代号，迟到结果一律拒绝落库；
 * 计算异常只把任务标记 failed，绝不修改已揭示前缀（失败不推进进度）。
 """
 from __future__ import annotations
@@ -11,7 +12,7 @@ import logging
 import threading
 import time
 
-from . import database
+from . import classifier, database
 from .optimizer import solve_queue
 from .tfidf_model import get_model
 
@@ -51,16 +52,22 @@ class ComputeWorker:
         while not self._stop.is_set():
             try:
                 job = database.claim_pending_job()
+                cjob = (
+                    database.claim_pending_classify_job() if job is None else None
+                )
             except Exception:  # pragma: no cover - 数据库临时故障重试
                 log.exception("领取任务失败，稍后重试")
                 time.sleep(0.5)
                 continue
-            if job is None:
+            if job is None and cjob is None:
                 self._stop.wait(0.25)
                 continue
             self._busy.set()
             try:
-                self._process(job)
+                if job is not None:
+                    self._process(job)
+                else:
+                    self._process_classify(cjob)
             finally:
                 self._busy.clear()
 
@@ -104,6 +111,35 @@ class ComputeWorker:
             log.exception("世代 %s 重算失败", generation)
             try:
                 database.fail_job(generation, f"{type(exc).__name__}: {exc}")
+            except Exception:  # pragma: no cover
+                log.exception("写入失败状态时出错")
+
+    def _process_classify(self, job: dict) -> None:
+        """稿件归档判定：对提交时的稿件快照评分，迟到结果拒绝落库。"""
+        generation = job["generation"]
+        delay = max(0, int(job.get("compute_delay_ms", 0))) / 1000.0
+        try:
+            # 慢判定窗口：此期间编辑可以继续改稿，产生新稿件世代。
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline:
+                if self._stop.is_set():
+                    return
+                time.sleep(min(0.1, deadline - time.monotonic()))
+
+            manuscript = database.get_manuscript()
+            # 双重检查：开始计算前确认自己仍是最新稿件世代
+            if manuscript["generation"] != generation:
+                database.fail_classify_job(generation, "计算开始前稿件已变更，任务作废")
+                return
+
+            result = classifier.classify(job["text_snapshot"])
+            accepted = database.complete_classify_job(generation, result)
+            if not accepted:
+                log.info("稿件世代 %s 的迟到归档结果已被丢弃", generation)
+        except Exception as exc:
+            log.exception("稿件世代 %s 归档判定失败", generation)
+            try:
+                database.fail_classify_job(generation, f"{type(exc).__name__}: {exc}")
             except Exception:  # pragma: no cover
                 log.exception("写入失败状态时出错")
 

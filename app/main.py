@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FastAPI 应用：推荐队列的条件管理、异步重查、分组揭示与演示页面。"""
+"""FastAPI 应用：推荐队列的条件管理、异步重查、分组揭示、稿件主题归档与演示页面。"""
 from __future__ import annotations
 
 import logging
@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database
+from . import classifier, database
 from .articles_data import ARTICLES, TOPICS
 from .tfidf_model import get_model
 from .worker import get_worker
@@ -31,6 +31,11 @@ class ConditionIn(BaseModel):
 
 class ExclusionIn(BaseModel):
     article_id: int = Field(ge=1)
+    compute_delay_ms: int = Field(default=0, ge=0, le=30000)
+
+
+class ManuscriptIn(BaseModel):
+    text: str = Field(description="待归档稿件正文")
     compute_delay_ms: int = Field(default=0, ge=0, le=30000)
 
 def _validate_quotas(quotas: dict[str, int]) -> None:
@@ -53,6 +58,13 @@ def _validate_interest(interest: str) -> None:
         raise HTTPException(422, "兴趣短文过长（上限 2000 字）")
 
 
+def _validate_manuscript(text: str) -> None:
+    if not text or not text.strip():
+        raise HTTPException(422, "稿件正文不能为空")
+    if len(text) > 2000:
+        raise HTTPException(422, "稿件正文过长（上限 2000 字）")
+
+
 def _article_brief(a: dict) -> dict:
     return {"id": a["id"], "title": a["title"], "topic": a["topic"], "author": a["author"]}
 
@@ -63,10 +75,28 @@ def _status_payload() -> dict:
     plan = None
     if job and job["status"] == "done" and job["generation"] == state["generation"]:
         plan = job["result"]
+    manuscript = database.get_manuscript()
+    cjob = database.get_latest_classify_job()
+    classify_result = None
+    if (
+        cjob
+        and cjob["status"] == "done"
+        and cjob["generation"] == manuscript["generation"]
+    ):
+        classify_result = cjob["result"]
+    try:
+        calibration = classifier.get_calibration().summary()
+    except Exception:  # pragma: no cover - 校准异常不拖垮状态接口
+        log.exception("校准信息计算失败")
+        calibration = None
     return {
         "state": state,
         "job": job,
         "plan": plan,
+        "manuscript": manuscript,
+        "classify_job": cjob,
+        "classify_result": classify_result,
+        "calibration": calibration,
         "topics": TOPICS,
         "articles": [_article_brief(a) for a in ARTICLES],
     }
@@ -75,11 +105,12 @@ def _status_payload() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
-    # 预热 TF-IDF（仅文章拟合），失败不影响启动，worker 内会再试
+    # 预热 TF-IDF（仅文章拟合）与归档阈值校准，失败不影响启动，worker 内会再试
     try:
         get_model()
+        classifier.get_calibration()
     except Exception:  # pragma: no cover
-        log.exception("TF-IDF 预热失败")
+        log.exception("TF-IDF / 校准预热失败")
     get_worker().start()
     try:
         yield
@@ -172,6 +203,18 @@ def reveal() -> dict:
 
 @app.post("/api/reset")
 def reset_demo() -> dict:
-    """重置演示：清空揭示、排除与任务，世代回到 1。"""
+    """重置演示：清空揭示、排除、稿件与任务，世代回到 1。"""
     database.reset_all(DEFAULT_INTEREST, {t: 1 for t in TOPICS})
+    return _status_payload()
+
+
+@app.put("/api/manuscript")
+def update_manuscript(body: ManuscriptIn) -> dict:
+    """提交/修改稿件正文：开启新稿件世代并触发异步归档判定。
+
+    旧世代的判定任务立即作废；其迟到结果即使之后也算完，也不会写回覆盖
+    当前稿件的判定（见 database.complete_classify_job 的世代核对）。
+    """
+    _validate_manuscript(body.text)
+    database.submit_manuscript(body.text, body.compute_delay_ms)
     return _status_payload()
